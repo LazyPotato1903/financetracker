@@ -1,0 +1,10 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
+
+# git bundle (only needed before you had a real repo)
+*.bundle
+
+# NOTE: data/finance.db here is SAMPLE data and is meant to be committed.
+# Never commit your real finance.db — import it privately in the app instead.
