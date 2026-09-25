@@ -3,7 +3,7 @@
  * Version 1.0.0  |  Base currency PHP (₱) + USD  |  100% client-side & private
  * Data persists in the browser (IndexedDB). Import/Export a finance.db file.
  * ==========================================================================*/
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const BASE_CCY = "PHP";
 const SYM = "₱";
 const IDB_NAME = "financeTracker";
@@ -93,8 +93,11 @@ function money(v,sym=true){
   return (v<0?"-":"")+(sym?SYM:"")+s;
 }
 function pct(v){ return (Number(v||0)*100).toFixed(1)+"%"; }
-function todayISO(){ return new Date().toISOString().slice(0,10); }
-function monthKey(d){ return (d||new Date()).toISOString().slice(0,7); }
+function pad2(n){ return String(n).padStart(2,"0"); }
+function todayISO(){ const d=new Date(); return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate()); }
+// LOCAL month key — avoids the UTC off-by-one that dropped the current month
+function monthKey(d){ d=d||new Date(); return d.getFullYear()+"-"+pad2(d.getMonth()+1); }
+function monthLabel(mk){ const [y,m]=mk.split("-").map(Number); return new Date(y,m-1,1).toLocaleDateString(undefined,{month:"short",year:"2-digit"}); }
 function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
 /* ---------- computations (mirror desktop app) ---------- */
@@ -138,7 +141,13 @@ function categoryNames(type){ return all(type?"SELECT name FROM categories WHERE
 function accountNames(){ return all("SELECT name FROM accounts ORDER BY name").map(r=>r.name); }
 function tagNames(){ return all("SELECT name FROM tags ORDER BY name").map(r=>r.name); }
 function ccyCodes(){ return all("SELECT code FROM currencies ORDER BY code").map(r=>r.code); }
-function monthOffset(off){ const d=new Date(); d.setDate(1); d.setMonth(d.getMonth()-off); return d.toISOString().slice(0,7); }
+function monthOffset(off){ const d=new Date(); d.setDate(1); d.setMonth(d.getMonth()-off); return d.getFullYear()+"-"+pad2(d.getMonth()+1); }
+// ---- analytics helpers ----
+function ytd(type){ const y=String(new Date().getFullYear());
+  return Number(scalar("SELECT SUM(amount*(SELECT rate FROM currencies WHERE code=transactions.currency)) FROM transactions WHERE type=? AND substr(date,1,4)=?",[type,y])); }
+function liquidCash(){ let c=0; for(const a of all("SELECT name,type,starting FROM accounts")){ if(a.type!=='Credit Card'){ const b=accountBalance(a.name,a.starting); if(b>0)c+=b; } } return c; }
+function tagTotals(mk){ return all("SELECT COALESCE(NULLIF(TRIM(tag),''),'Untagged') AS tag, SUM(amount*(SELECT rate FROM currencies WHERE code=transactions.currency)) AS base FROM transactions WHERE type='Expense' AND substr(date,1,7)=? GROUP BY tag ORDER BY base DESC",[mk]); }
+function categoryDeltas(mk,prev){ const out=[]; for(const n of categoryNames('Expense')){ const cur=monthTotal('Expense',mk,n), pv=monthTotal('Expense',prev,n); if(cur||pv) out.push({name:n,cur,prev:pv,delta:cur-pv}); } out.sort((a,b)=>Math.abs(b.delta)-Math.abs(a.delta)); return out; }
 async function snapshotNetWorth(){
   const mk=monthKey(), a=totalAssets(), l=totalLiabilities();
   await run("INSERT INTO networth(month,assets,liabilities,networth) VALUES(?,?,?,?) ON CONFLICT(month) DO UPDATE SET assets=excluded.assets,liabilities=excluded.liabilities,networth=excluded.networth",[mk,a,l,a-l]);
@@ -168,23 +177,37 @@ function refresh(){ show(CURRENT); }
 
 /* ---------- Dashboard ---------- */
 function renderDashboard(v){
-  const mk=monthKey();
+  const mk=monthKey(), prev=monthOffset(1);
   const income=monthTotal("Income",mk), expense=monthTotal("Expense",mk), net=income-expense;
   const rate=income?net/income:0, nw=netWorth(), score=healthScore();
   const now=new Date(), day=now.getDate();
   const eom=new Date(now.getFullYear(),now.getMonth()+1,0).getDate();
   const projMonth=day?net/day*eom:net;
+  const cash=liquidCash();
+  const avgDaily=day?expense/day:0;
+  const runway=avgDaily>0?Math.round(cash/avgDaily):null;
+  const ytdInc=ytd("Income"), ytdExp=ytd("Expense"), ytdNet=ytdInc-ytdExp;
 
   const kpis=[
     ["Total Income",money(income),"good"],["Total Expenses",money(expense),"bad"],
     ["Net Savings",money(net),net>=0?"good":"bad"],["Savings Rate",pct(rate),"accent"],
     ["Net Worth",money(nw),""],["Health Score",score+"/100",score>=70?"good":score>=40?"warn":"bad"]
   ];
+  const stats=[
+    ["Cash Runway",runway==null?"—":runway+" days","accent"],
+    ["Avg Daily Spend",money(avgDaily),"bad"],
+    ["Liquid Cash",money(cash),""],
+    ["YTD Income",money(ytdInc),"good"],
+    ["YTD Expenses",money(ytdExp),"bad"],
+    ["YTD Net Savings",money(ytdNet),ytdNet>=0?"good":"bad"]
+  ];
   v.innerHTML=`
     <div class="page-head"><div><h1>Cash Flow Dashboard</h1>
       <div class="sub">${now.toLocaleDateString(undefined,{month:'long',year:'numeric'})} · Base currency ${BASE_CCY}</div></div></div>
     <div class="kpis">${kpis.map(k=>`<div class="card kpi"><div class="label">${k[0]}</div>
       <div class="value ${k[2]}">${k[1]}</div></div>`).join("")}</div>
+    <div class="kpis">${stats.map(k=>`<div class="card kpi"><div class="label">${k[0]}</div>
+      <div class="value ${k[2]}" style="font-size:19px">${k[1]}</div></div>`).join("")}</div>
     <div class="panels">
       <div class="panel"><h3>Spending Breakdown — This Month</h3><div class="chart-wrap"><canvas id="pie"></canvas></div></div>
       <div class="panel"><h3>Income vs Expenses — Monthly Trend</h3><div class="chart-wrap"><canvas id="bars"></canvas></div>
@@ -192,11 +215,19 @@ function renderDashboard(v){
         <div class="fc-line">Projected annual savings (run-rate): <b>${money(projMonth*12)}</b></div></div>
     </div>
     <div class="panels" style="margin-top:16px">
-      <div class="panel"><h3>Top 5 Purchases — This Month</h3>${topPurchases(mk)}</div>
+      <div class="panel"><h3>Savings Rate — Trend</h3><div class="chart-wrap"><canvas id="srtrend"></canvas></div></div>
+      <div class="panel"><h3>Spending by Tag — This Month</h3><div class="chart-wrap"><canvas id="tagpie"></canvas></div></div>
+    </div>
+    <div class="panels" style="margin-top:16px">
+      <div class="panel"><h3>Spending vs Last Month</h3>${movers(mk,prev)}</div>
       <div class="panel"><h3>Budget Health</h3>${budgetMini(mk)}</div>
+    </div>
+    <div class="panels" style="margin-top:16px">
+      <div class="panel"><h3>Top 5 Purchases — This Month</h3>${topPurchases(mk)}</div>
+      <div class="panel"><h3>Net Worth — Trend</h3><div class="chart-wrap"><canvas id="nwmini"></canvas></div></div>
     </div>`;
 
-  // pie
+  // pie — category spend this month
   const cats=[];
   for(const n of categoryNames("Expense")){ const amt=monthTotal("Expense",mk,n); if(amt>0)cats.push([n,amt]); }
   cats.sort((a,b)=>b[1]-a[1]);
@@ -205,15 +236,45 @@ function renderDashboard(v){
     options:{plugins:{legend:{position:"right",labels:{boxWidth:12,font:{size:11}}}},cutout:"55%",maintainAspectRatio:false}}));
   else document.getElementById("pie").parentElement.innerHTML='<div class="empty">No spending yet this month</div>';
 
-  // bars
+  // bars — income vs expenses, last 6 months (labels via monthLabel, current month included)
   const months=[]; for(let o=5;o>=0;o--){const m=monthOffset(o);
-    months.push([new Date(m+"-01").toLocaleDateString(undefined,{month:'short',year:'2-digit'}),monthTotal("Income",m),monthTotal("Expense",m)]);}
+    months.push([monthLabel(m),monthTotal("Income",m),monthTotal("Expense",m)]);}
   CH.push(new Chart(document.getElementById("bars"),{type:"bar",
     data:{labels:months.map(m=>m[0]),datasets:[
       {label:"Income",data:months.map(m=>m[1]),backgroundColor:"#2e7d32"},
       {label:"Expenses",data:months.map(m=>m[2]),backgroundColor:"#c62828"}]},
     options:{maintainAspectRatio:false,plugins:{legend:{position:"top",labels:{boxWidth:12}}},
       scales:{y:{ticks:{callback:v=>SYM+Number(v).toLocaleString()}}}}}));
+
+  // savings-rate trend line
+  const srL=[], srD=[];
+  for(let o=5;o>=0;o--){const m=monthOffset(o); const inc=monthTotal("Income",m), exp=monthTotal("Expense",m);
+    srL.push(monthLabel(m)); srD.push(inc? +(((inc-exp)/inc)*100).toFixed(1):0);}
+  CH.push(new Chart(document.getElementById("srtrend"),{type:"line",
+    data:{labels:srL,datasets:[{label:"Savings rate",data:srD,borderColor:"#2e7d6b",backgroundColor:"rgba(46,125,107,.12)",fill:true,tension:.25,pointRadius:3}]},
+    options:{maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{ticks:{callback:v=>v+"%"}}}}}));
+
+  // spending by tag donut
+  const tags=tagTotals(mk).filter(t=>t.base>0);
+  if(tags.length) CH.push(new Chart(document.getElementById("tagpie"),{type:"doughnut",
+    data:{labels:tags.map(t=>t.tag),datasets:[{data:tags.map(t=>t.base),backgroundColor:tags.map((_,i)=>PALETTE[i%PALETTE.length]),borderWidth:2,borderColor:"#fff"}]},
+    options:{plugins:{legend:{position:"right",labels:{boxWidth:12,font:{size:11}}}},cutout:"55%",maintainAspectRatio:false}}));
+  else document.getElementById("tagpie").parentElement.innerHTML='<div class="empty">No tagged spending this month</div>';
+
+  // net worth mini trend
+  const nwh=all("SELECT month,networth FROM networth ORDER BY month");
+  if(nwh.length) CH.push(new Chart(document.getElementById("nwmini"),{type:"line",
+    data:{labels:nwh.map(r=>r.month),datasets:[{label:"Net worth",data:nwh.map(r=>r.networth),borderColor:"#1f3a5f",backgroundColor:"rgba(31,58,95,.12)",fill:true,tension:.25,pointRadius:3}]},
+    options:{maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{ticks:{callback:v=>SYM+Number(v).toLocaleString()}}}}}));
+  else document.getElementById("nwmini").parentElement.innerHTML='<div class="empty">Snapshot net worth (Net Worth tab) to see a trend</div>';
+}
+function movers(mk,prev){
+  const rows=categoryDeltas(mk,prev).slice(0,8);
+  if(!rows.length) return '<div class="empty">No spending to compare</div>';
+  return `<div class="table-wrap"><table><thead><tr><th>Category</th><th class="num">This Month</th><th class="num">Last Month</th><th class="num">Change</th></tr></thead><tbody>${
+    rows.map(r=>{const up=r.delta>0; const cls=up?'neg':(r.delta<0?'pos':''); const sign=up?'▲':(r.delta<0?'▼':'');
+    return `<tr><td>${esc(r.name)}</td><td class="num">${money(r.cur)}</td><td class="num">${money(r.prev)}</td>
+      <td class="num ${cls}">${sign} ${money(Math.abs(r.delta))}</td></tr>`;}).join("")}</tbody></table></div>`;
 }
 function topPurchases(mk){
   const rows=all("SELECT notes,category,amount*(SELECT rate FROM currencies WHERE code=transactions.currency) AS base FROM transactions WHERE type='Expense' AND substr(date,1,7)=? ORDER BY base DESC LIMIT 5",[mk]);
